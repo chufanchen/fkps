@@ -1,9 +1,28 @@
 [project]
 name = "qgf"
 version = "0.0.0"
-requires-python = ">= 3.9"
+requires-python = ">=3.9"
 dependencies = [
+    "absl-py",
+    "distrax",
+    "dm-control",
+    "dm-env",
+    "flax",
+    "gymnasium",
+    "h5py",
+    "imageio",
+    "jax[cuda12]",
+    "lxml",
+    "ml-collections",
     "mujoco-py>=2.1.2.14",
+    "numpy",
+    "ogbench",
+    "optax",
+    "pillow",
+    "scipy",
+    "tqdm",
+    "typing-extensions",
+    "wandb",
 ]
 
 [project.optional-dependencies]

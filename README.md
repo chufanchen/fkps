@@ -5,10 +5,20 @@ process with the critic gradient — achieving policy improvement without any ac
 
 ## Installation
 
+**With uv (recommended):**
+
 ```bash
-uv venv --python 3.9
+uv venv --python 3.10
 source .venv/bin/activate
-uv pip sync requirements.txt
+uv sync
+```
+
+**With pip:**
+
+```bash
+python3.10 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
 ## Datasets
