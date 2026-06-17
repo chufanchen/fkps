@@ -76,7 +76,6 @@ class SbatchGenerator:
         limit=None,
         ram_gb=24,
         job_name="qgf",
-        user="your_username",  # kept for backward compatibility; unused
         time="4:00:00",
         log_dir=None,
         gres="gpu:1",
