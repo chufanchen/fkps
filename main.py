@@ -361,10 +361,16 @@ def main(_):
                 num_eval_episodes=FLAGS.eval_episodes,
                 rejection_sampling=rejection_sampling,
             )
-        if FLAGS.video_episodes > 0:
-            eval_metrics["video"] = get_wandb_video(renders=cur_renders)
-        wandb.log(eval_metrics, step=FLAGS.restore_epoch)
-        eval_logger.log(eval_metrics, step=FLAGS.restore_epoch)
+            
+            if rejection_sampling > 1:
+                eval_metrics = {
+                    f"best_of_{rejection_sampling}_{k}": v
+                    for k, v in eval_metrics.items()
+                }
+
+            wandb.log(eval_metrics, step=FLAGS.restore_epoch)
+            eval_logger.log(eval_metrics, step=FLAGS.restore_epoch)
+
         eval_logger.close()
         wandb.finish()
         return
