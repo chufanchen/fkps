@@ -276,7 +276,6 @@ def _evaluate_agent(
     *,
     eval_env,
     vec_eval_env,
-    config,
     num_eval_episodes,
     rejection_sampling,
 ):
@@ -359,7 +358,6 @@ def main(_):
                 agent,
                 eval_env=eval_env,
                 vec_eval_env=vec_eval_env,
-                config=config,
                 num_eval_episodes=FLAGS.eval_episodes,
                 rejection_sampling=rejection_sampling,
             )
@@ -538,7 +536,6 @@ def main(_):
                     agent,
                     eval_env=eval_env,
                     vec_eval_env=vec_eval_env,
-                    config=config,
                     num_eval_episodes=FLAGS.eval_episodes,
                     rejection_sampling=rejection_sampling,
                 )
