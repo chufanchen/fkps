@@ -1,7 +1,7 @@
 import copy
 from collections import defaultdict
 from functools import partial
-from typing import List, Optional
+from typing import List
 
 import jax
 import numpy as np
@@ -77,55 +77,89 @@ class SingleEnvBatchAdapter:
         return self._env.render()
 
 
-def _maybe_concat_goal_to_obs(
-    observations: np.ndarray,
-    goals: List,
-    num_envs: int,
-    policy_obs_dim: Optional[int],
-) -> np.ndarray:
-    """If env returns state-only but training used state‖goal, match dataset observation width."""
-    if policy_obs_dim is None:
-        return observations
-    obs = np.asarray(observations)
-    if obs.ndim == 1:
-        obs = obs[None, :]
-    rows = []
-    for i in range(num_envs):
-        o = np.asarray(obs[i]).reshape(-1)
-        g = goals[i] if i < len(goals) else None
-        if g is not None:
-            g = np.asarray(g).reshape(-1)
-            if o.shape[0] == policy_obs_dim:
-                rows.append(o)
-            elif o.shape[0] + g.shape[0] == policy_obs_dim:
-                rows.append(np.concatenate([o, g], axis=-1))
+def _convert_batched_infos_to_list(vector_infos, num_envs):
+    """Unbatch a Gymnasium vector-env info dict into per-env info dicts.
+
+    Args:
+        vector_infos: Batched info from ``AsyncVectorEnv`` / ``SyncVectorEnv``.
+            Each data key ``k`` is paired with an optional mask key ``_k`` (bool
+            array of length ``num_envs``) indicating which envs set that key.
+            Leaf values are length-``num_envs`` arrays. Gymnasium 1.0+ may nest
+            this structure for dict-valued info (e.g. ``episode``, ``total``).
+
+            Example (Gymnasium 0.29, ``num_envs=2``)::
+
+                {
+                    "success": array([1.0, 0.0]),
+                    "_success": array([True, True]),
+                }
+
+            Example (Gymnasium 1.0+, ``num_envs=2``)::
+
+                {
+                    "total": {
+                        "timesteps": array([10, 20]),
+                        "_timesteps": array([True, True]),
+                    },
+                    "_total": array([True, True]),
+                }
+
+        num_envs: Number of parallel environments in the vector env.
+
+    Returns:
+        A list of length ``num_envs``. Each entry is a plain single-env info dict
+        in the same shape a non-vectorized env would return, e.g.::
+
+            [
+                {"success": 1.0, "total": {"timesteps": 10}},
+                {"success": 0.0, "total": {"timesteps": 20}},
+            ]
+
+        Keys whose mask is False for an env are omitted from that env's dict.
+    """
+    per_env = [dict() for _ in range(num_envs)]
+    for key, value in vector_infos.items():
+        # Keys prefixed with "_" are per-env presence masks, not data.
+        if key.startswith("_"):
+            continue
+
+        mask = vector_infos.get(f"_{key}")
+        if isinstance(value, dict):
+            # Gymnasium 1.0+: nested info dicts are batched recursively.
+            nested = _convert_batched_infos_to_list(value, num_envs)
+            if mask is None:
+                for idx, nested_info in enumerate(nested):
+                    per_env[idx][key] = nested_info
             else:
-                rows.append(o)
-        else:
-            rows.append(o)
-    return np.stack(rows, axis=0)
-
-
-def _vector_infos_to_list(infos, num_envs):
-    if isinstance(infos, dict) and any(k.startswith("_") for k in infos):
-        per_env = [dict() for _ in range(num_envs)]
-        for key, value in infos.items():
-            if key.startswith("_"):
-                continue
-            mask = infos.get(f"_{key}")
+                for idx, (nested_info, has_info) in enumerate(zip(nested, mask)):
+                    if has_info:
+                        per_env[idx][key] = nested_info
+        elif isinstance(value, np.ndarray):
             if mask is None:
                 mask = np.ones(num_envs, dtype=bool)
             for idx in range(num_envs):
                 if mask[idx]:
                     per_env[idx][key] = value[idx]
-        return per_env
-    if isinstance(infos, dict):
-        return [infos for _ in range(num_envs)]
-    if isinstance(infos, (list, tuple)):
-        return list(infos)
-    if infos is None:
-        return [dict() for _ in range(num_envs)]
-    return [{"info": infos} for _ in range(num_envs)]
+        elif mask is None:
+            for idx in range(num_envs):
+                per_env[idx][key] = value
+        else:
+            for idx, has_info in enumerate(mask):
+                if has_info:
+                    per_env[idx][key] = value
+    return per_env
+
+
+def _vector_infos_to_list(infos, num_envs):
+    """Convert env info to a list of per-env dicts."""
+    if not isinstance(infos, dict):
+        raise TypeError(f"Expected info dict, got {type(infos).__name__}")
+    # Vector envs (AsyncVectorEnv) tag batched info with per-key "_<key>" masks.
+    # Single-env dicts (via SingleEnvBatchAdapter) have no such keys.
+    # Empty vector info ({}) also has no "_" keys; replicating it is correct.
+    if any(k.startswith("_") for k in infos):
+        return _convert_batched_infos_to_list(infos, num_envs)
+    return [infos for _ in range(num_envs)]
 
 
 def _prepare_actor(agent, guidance_weight, rejection_sampling):
@@ -155,7 +189,6 @@ def run_episodes(
     task_id=None,
     eval_gaussian=None,
     guidance_weight=None,
-    goal_conditioned=False,
     should_render=False,
     video_frame_skip=3,
     rejection_sampling=1,
@@ -176,22 +209,16 @@ def run_episodes(
         rejection_sampling=rejection_sampling,
     )
 
-    # Detect action chunking from agent config.
-    horizon_length = 1
-    action_dim = None
-    policy_obs_dim = None
-    if hasattr(agent, "config"):
-        horizon_length = int(agent.config.get("horizon_length", 1))
-        action_dim = agent.config.get("action_dim", None)
-        if action_dim is not None:
-            action_dim = int(action_dim)
-        _pod = agent.config.get("policy_observation_dim")
-        if _pod is not None:
-            policy_obs_dim = int(_pod)
+    # Detect action chunking from agent config. `horizon_length` can be used for
+    # n-step targets without implying that the policy emits an action chunk.
+    horizon_length = int(agent.config.get("horizon_length", 1))
+    action_chunking = bool(agent.config.get("action_chunking", False))
+    action_dim = agent.config.get("action_dim", None)
+    if action_dim is not None:
+        action_dim = int(action_dim)
+    rollout_horizon = horizon_length if action_chunking else 1
 
-    observations, reset_infos = env.reset(
-        options=dict(task_id=task_id, render_goal=should_render)
-    )
+    observations, _ = env.reset(options=dict(task_id=task_id))
 
     num_envs = env.num_envs
 
@@ -202,19 +229,6 @@ def run_episodes(
     trajectories = [defaultdict(list) for _ in range(num_envs)]
     renders = [[] for _ in range(num_envs)]
 
-    # Goals
-    infos_per_env = (
-        _vector_infos_to_list(reset_infos, num_envs)
-        if isinstance(reset_infos, dict)
-        else ([reset_infos] * num_envs)
-    )
-    goals = [info.get("goal") for info in infos_per_env]
-    goal_frames = [info.get("goal_rendered") for info in infos_per_env]
-
-    observations = _maybe_concat_goal_to_obs(
-        observations, goals, num_envs, policy_obs_dim
-    )
-
     rng = np.random.default_rng()
 
     # Per-env action queues for action chunking (H > 1).
@@ -222,26 +236,24 @@ def run_episodes(
 
     while not np.all(~active):
         # Determine which envs need a new action chunk.
+        # Keep stepping inactive vector sub-envs too. Gymnasium vector envs
+        # auto-reset completed sub-envs, and we ignore their transitions below.
         need_chunk = [i for i in range(num_envs) if not action_queues[i]]
         if need_chunk:
             subset_obs = observations[need_chunk]
-            raw = (
-                actor_fn(observations=subset_obs, goals=[goals[i] for i in need_chunk])
-                if goal_conditioned
-                else actor_fn(observations=subset_obs)
-            )
+            raw = actor_fn(observations=subset_obs)
             raw = np.atleast_2d(np.array(raw))
 
-            if horizon_length > 1:
+            if rollout_horizon > 1:
                 # raw: (len(need_chunk), H * action_dim) -> (len(need_chunk), H, action_dim)
                 if action_dim is None:
-                    if raw.shape[-1] % horizon_length != 0:
+                    if raw.shape[-1] % rollout_horizon != 0:
                         raise ValueError(
                             f"Cannot infer per-step action_dim: raw.shape[-1]={raw.shape[-1]}, "
-                            f"horizon_length={horizon_length}"
+                            f"rollout_horizon={rollout_horizon}"
                         )
-                    action_dim = raw.shape[-1] // horizon_length
-                chunks = raw.reshape(len(need_chunk), horizon_length, action_dim)
+                    action_dim = raw.shape[-1] // rollout_horizon
+                chunks = raw.reshape(len(need_chunk), rollout_horizon, action_dim)
                 for j, idx in enumerate(need_chunk):
                     action_queues[idx].extend(chunks[j])
             else:
@@ -275,10 +287,6 @@ def run_episodes(
                         next_observation = info["final_observation"]
                     if "final_info" in info:
                         info = copy.deepcopy(info["final_info"])
-                if "goal" in info:
-                    goals[idx] = info["goal"]
-                if should_render and "goal_rendered" in info:
-                    goal_frames[idx] = info["goal_rendered"]
                 transition = dict(
                     observation=observations[idx],
                     next_observation=next_observation,
@@ -293,27 +301,13 @@ def run_episodes(
                     lengths[idx] % video_frame_skip == 0 or done_now[idx]
                 ):
                     frame = env.render().copy()
-                    goal_frame = goal_frames[idx]
-                    renders[idx].append(
-                        np.concatenate([goal_frame, frame], axis=0)
-                        if goal_frame is not None
-                        else frame
-                    )
+                    renders[idx].append(frame)
 
                 if done_now[idx]:
                     action_queues[idx] = []  # clear queue on episode end
                     active[idx] = False
 
-            o_next = np.asarray(next_observation).reshape(-1)
-            if (
-                policy_obs_dim is not None
-                and goals[idx] is not None
-                and o_next.shape[0] < policy_obs_dim
-            ):
-                g = np.asarray(goals[idx]).reshape(-1)
-                if o_next.shape[0] + g.shape[0] == policy_obs_dim:
-                    o_next = np.concatenate([o_next, g], axis=-1)
-            observations[idx] = o_next
+            observations[idx] = np.asarray(next_observation).reshape(-1)
 
     if should_render:
         renders = [np.array(r) for r in renders]
@@ -331,7 +325,6 @@ def eval_standard(
     video_frame_skip=3,
     eval_gaussian=None,
     guidance_weight=None,
-    goal_conditioned=False,
     rejection_sampling=1,
 ):
     """Evaluate the agent in the environment with optimized execution.
@@ -353,7 +346,6 @@ def eval_standard(
             task_id,
             eval_gaussian,
             guidance_weight,
-            goal_conditioned,
             should_render=False,
             video_frame_skip=video_frame_skip,
             rejection_sampling=rejection_sampling,
@@ -374,7 +366,6 @@ def eval_standard(
             task_id,
             eval_gaussian,
             guidance_weight,
-            goal_conditioned,
             should_render=True,
             video_frame_skip=video_frame_skip,
             rejection_sampling=rejection_sampling,
