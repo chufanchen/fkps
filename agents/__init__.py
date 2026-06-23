@@ -3,12 +3,14 @@ from agents.cfgrl import CFGRLAgent
 from agents.dcgql import DCGQLAgent
 from agents.dsrl import DSRLAgent
 from agents.edp import EDPAgent
+from agents.fkd_diffusion import FKDDiffusionAgent
 from agents.fawac import FAWACAgent
 from agents.fbrac import FBRACAgent
 from agents.fql import FQLAgent
 from agents.grad_step import GradStepAgent
 from agents.ifql import IFQLAgent
 from agents.iql import IQLAgent
+from agents.iql_ddpm import IQLDDPMAgent
 from agents.iql_diffusion import IQLDiffusionAgent
 from agents.qam import QAMAgent
 from agents.qgf import QGFAgent
@@ -20,6 +22,7 @@ agents = dict(
     fql=FQLAgent,
     ifql=IFQLAgent,
     iql=IQLAgent,
+    iql_ddpm=IQLDDPMAgent,
     iql_diffusion=IQLDiffusionAgent,
     cfgrl=CFGRLAgent,
     qgf=QGFAgent,
@@ -27,6 +30,7 @@ agents = dict(
     sac=SACAgent,
     qam=QAMAgent,
     edp=EDPAgent,
+    fkd_diffusion=FKDDiffusionAgent,
     dcgql=DCGQLAgent,
     dsrl=DSRLAgent,
     fawac=FAWACAgent,

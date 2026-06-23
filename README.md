@@ -3,23 +3,20 @@
 <div id="user-content-toc" style="margin-bottom: 50px">
   <ul align="center" style="list-style: none;">
     <summary>
-      <h1>Q-Guided Flow</h1>
+      <h1>Feynman-Kac Policy Steering</h1>
       <br>
-      <h2><a href="https://arxiv.org/pdf/2606.11087" style="color: #73A4C6">[Paper]</a> &emsp; <a href="https://q-guided-flow.github.io/" style="color: #73A4C6">[Website]</a></h2>
+      <h2><a href="." style="color: #73A4C6">[Paper]</a> &emsp; <a href="." style="color: #73A4C6">[Website]</a></h2>
     </summary>
   </ul>
 </div>
 
-<img src="assets/teaser.png" width="100%">
+<!-- <img src="assets/teaser.png" width="100%"> -->
 
 </div>
 
 ## Overview
 
-Q-guided flow (QGF) is a test-time RL algorithm that trains a reference *flow-matching* policy
-via behavioral cloning and a TD-based critic separately, then at inference guides the denoising
-process with a novel critic gradient estimator to sample higher-value actions — achieving
-policy improvement without any actor-critic training.
+Feynman-Kac Policy Steering (FKPS) is a test-time RL algorithm that trains a reference flow-matching policy via behavioral cloning and a TD-based critic separately, then at inference steers the denoising process through Feynman-Kac particle resampling — maintaining a population of candidate action trajectories and resampling them proportionally to a calibrated critic potential — to sample higher-value actions, achieving policy improvement without any actor-critic training.
 
 ## Installation
 
@@ -68,7 +65,34 @@ All experiments are launched through `main.py`. The agent configuration is passe
 `--agent=agents/<agent>.py` and all agent hyperparameters can be overridden with
 `--agent.<key>=<value>`.
 
-### QGF (our method)
+### FKPS (Ours)
+
+```bash
+## diffusion policy
+MUJOCO_GL=egl python main.py \
+  --agent=agents/iql_ddpm.py \
+  --agent.action_chunking=True \
+  --agent.horizon_length=5 \
+  --agent.batch_size=1024 \
+  --agent.value_hidden_dims="(1024,1024,1024,1024)" \
+  --agent.actor_hidden_dims="(1024,1024,1024,1024)" \
+  --agent.discount=0.999 \
+  --agent.diffusion_steps=10 \
+  --agent.beta_schedule=vp \
+  --agent.clip_sampler=True \
+  --agent.alpha=1.0 \
+  --agent.expectile=0.9 \
+  --agent.fkd_num_particles=64 \
+  --agent.fkd_lambda=1.0 \
+  --agent.fkd_potential=diff \
+  --agent.fkd_adaptive=True \
+  --agent.fkd_resample_freq=1 \
+  --env_name=cube-triple-play-singletask-task1-v0 \
+  --ogbench_dataset_dir=$OGBENCH_DATA_DIR/cube-triple-play-100m-v0/ \
+  --offline_steps=500000
+```
+
+### QGF(Baseline)
 
 ```bash
 MUJOCO_GL=egl python main.py \
@@ -155,11 +179,4 @@ This codebase is built with reference implementations from [FQL](https://github.
 ## BibTeX
 
 ```bibtex
-@article{zhou2026qgf,
-  title   = {Test-Time Gradient Guidance of Flow Policies in Reinforcement Learning},
-  author  = {Zhou, Zhiyuan and Peng, Andy and Xu, Charles and Li, Qiyang and
-             Springenberg, Jost Tobias and Frans, Kevin and Levine, Sergey},
-  year    = {2026},
-  journal = {arXiv preprint arXiv:2606.11087},
-}
 ```
