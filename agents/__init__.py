@@ -3,7 +3,6 @@ from agents.cfgrl import CFGRLAgent
 from agents.dcgql import DCGQLAgent
 from agents.dsrl import DSRLAgent
 from agents.edp import EDPAgent
-from agents.fkd_diffusion import FKDDiffusionAgent
 from agents.fawac import FAWACAgent
 from agents.fbrac import FBRACAgent
 from agents.fql import FQLAgent
@@ -30,7 +29,6 @@ agents = dict(
     sac=SACAgent,
     qam=QAMAgent,
     edp=EDPAgent,
-    fkd_diffusion=FKDDiffusionAgent,
     dcgql=DCGQLAgent,
     dsrl=DSRLAgent,
     fawac=FAWACAgent,
