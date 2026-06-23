@@ -16,8 +16,7 @@ import jax
 import jax.numpy as jnp
 import ml_collections
 import optax
-import torch
-from agents.fkd_steering import FKD, PotentialType
+from agents.fkd_jax import FKDJax, PotentialType
 from utils.diffusion import (
     DDPM,
     FourierFeatures,
@@ -50,6 +49,8 @@ class IQLDDPMAgent(flax.struct.PyTreeNode):
     betas: Any
     alphas: Any
     alpha_hats: Any
+    q_mean: Any
+    q_std: Any
 
     @staticmethod
     def expectile_loss(adv, diff, expectile):
@@ -178,7 +179,25 @@ class IQLDDPMAgent(flax.struct.PyTreeNode):
         new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
         self.target_update(new_network, "critic")
 
-        return self.replace(network=new_network, rng=new_rng), info
+        # Update running Q statistics for FKD normalization
+        if self.config["action_chunking"]:
+            batch_actions = jnp.reshape(
+                batch["actions"], (batch["actions"].shape[0], -1)
+            )
+        else:
+            batch_actions = batch["actions"][..., 0, :]
+        qs = self.network.select("target_critic")(
+            batch["observations"], batch_actions
+        )
+        q = qs.min(axis=0)
+        ema = self.config.get("q_stats_ema", 0.99)
+        new_q_mean = ema * self.q_mean + (1 - ema) * q.mean()
+        new_q_std = ema * self.q_std + (1 - ema) * q.std()
+
+        return self.replace(
+            network=new_network, rng=new_rng,
+            q_mean=new_q_mean, q_std=new_q_std,
+        ), info
 
     # ------------------------------------------------------------------
     # Inference — DDPM reverse sampling
@@ -234,70 +253,45 @@ class IQLDDPMAgent(flax.struct.PyTreeNode):
         )
         return output_tuple[0]
 
-    @staticmethod
-    def _jax_to_torch(x):
-        return torch.from_dlpack(jax.dlpack.to_dlpack(x))
-
-    @staticmethod
-    def _torch_to_jax(x):
-        return jnp.from_dlpack(x.detach())
-
-    def fkd_ddpm_sampler(
-        self,
-        rng,
-        observations,
-        noise,
-        *,
-        num_particles,
-        fkd_lambda,
-        fkd_potential,
-        fkd_adaptive,
-        fkd_resample_freq,
-        fkd_t_start,
-        fkd_t_end,
-    ):
-        """DDPM reverse sampling with FKD particle resampling.
-
-        Runs the standard DDPM reverse process but maintains num_particles
-        candidates per observation. At resampling steps, FKD evaluates
-        Q(s, x0_hat) on the denoised action prediction and resamples the
-        particle population proportionally to exp(lambda * Q).
-        """
+    def _build_fkd(self):
+        """Construct the FKDJax object from config. Called once at sample time."""
         diffusion_steps = self.config["diffusion_steps"]
-        obs_repeated = jnp.broadcast_to(
-            observations[None], (num_particles, *observations.shape)
-        )
-
-        def q_reward_fn(x0_preds_torch):
-            a_jax = self._torch_to_jax(x0_preds_torch)
-            qs = self.network.select("target_critic")(obs_repeated, a_jax)
-            q = qs.min(axis=0)
-            q = (q - q.mean()) / (q.std() + 1e-6)
-            return self._jax_to_torch(q)
-
+        fkd_t_end = int(self.config["fkd_t_end"])
         if fkd_t_end < 0:
             fkd_t_end = diffusion_steps - 1
-
-        fkd = FKD(
-            potential_type=PotentialType(fkd_potential),
-            lmbda=fkd_lambda,
-            num_particles=num_particles,
-            adaptive_resampling=fkd_adaptive,
-            resample_frequency=fkd_resample_freq,
-            resampling_t_start=fkd_t_start,
+        return FKDJax(
+            potential_type=PotentialType(str(self.config["fkd_potential"])),
+            lmbda=float(self.config["fkd_lambda"]),
+            num_particles=int(self.config["fkd_num_particles"]),
+            adaptive_resampling=bool(self.config["fkd_adaptive"]),
+            resample_frequency=int(self.config["fkd_resample_freq"]),
+            resampling_t_start=int(self.config["fkd_t_start"]),
             resampling_t_end=fkd_t_end,
             time_steps=diffusion_steps,
-            reward_fn=q_reward_fn,
-            device=torch.device("cpu"),
         )
 
-        current_x = noise
-        rng, denoise_key = jax.random.split(rng, 2)
-        input_time_proto = jnp.ones((*noise.shape[:-1], 1))
+    def _fkd_ddpm_sample_single(self, obs, noise, rng):
+        """FKD-steered DDPM reverse sampling for a single observation.
 
-        # DDPM reverse: t from T down to 1 — sampling_idx from 0 to T-1
-        for sampling_idx, t in enumerate(range(diffusion_steps, 0, -1)):
-            input_time = input_time_proto * t
+        obs: (obs_dim,), noise: (num_particles, action_dim), rng: PRNGKey.
+        Returns: best action (action_dim,).
+        """
+        num_particles = int(self.config["fkd_num_particles"])
+        diffusion_steps = self.config["diffusion_steps"]
+        obs_repeated = jnp.broadcast_to(obs[None], (num_particles, *obs.shape))
+
+        q_mean = self.q_mean
+        q_std = jnp.maximum(self.q_std, 1e-6)
+        fkd = self._build_fkd()
+        fkd_state = fkd.init_state()
+        t_schedule = jnp.arange(diffusion_steps, 0, -1)
+        sampling_indices = jnp.arange(diffusion_steps)
+
+        def scan_fn(carry, scan_inputs):
+            current_x, fkd_st, rng_ = carry
+            t, sampling_idx = scan_inputs
+
+            input_time = jnp.ones((*current_x.shape[:-1], 1)) * t
             eps_pred = self.network.select("actor")(
                 obs_repeated, current_x, input_time
             )
@@ -324,79 +318,73 @@ class IQLDDPMAgent(flax.struct.PyTreeNode):
             else:
                 current_x = x0_hat
 
-            denoise_key, key_ = jax.random.split(denoise_key, 2)
-            z = jax.random.normal(
-                key_, shape=(num_particles,) + current_x.shape[1:]
-            )
+            rng_, noise_key, fkd_key = jax.random.split(rng_, 3)
+            z = jax.random.normal(noise_key, current_x.shape)
             sigmas_t = jnp.sqrt(1 - self.alphas[t])
             current_x = current_x + (t > 1) * (sigmas_t * z)
 
-            # FKD resampling after the DDPM step:
-            # latents = current_x (noisy actions at t-1)
-            # x0_preds = x0_hat (denoised action estimate from this step)
-            latents_torch = self._jax_to_torch(current_x)
-            x0_preds_torch = self._jax_to_torch(x0_hat)
-            resampled_latents, _ = fkd.resample(
-                sampling_idx=sampling_idx,
-                latents=latents_torch,
-                x0_preds=x0_preds_torch,
-            )
-            current_x = self._torch_to_jax(resampled_latents)
+            # Compute normalized Q as reward signal for FKD
+            qs = self.network.select("target_critic")(obs_repeated, x0_hat)
+            rs_candidates = (qs.min(axis=0) - q_mean) / q_std
 
-        actions = jnp.clip(current_x, -1, 1)
+            current_x, fkd_st = fkd.resample(
+                fkd_st,
+                sampling_idx=sampling_idx,
+                latents=current_x,
+                rs_candidates=rs_candidates,
+                rng=fkd_key,
+            )
+
+            return (current_x, fkd_st, rng_), None
+
+        (final_x, _, _), _ = jax.lax.scan(
+            scan_fn,
+            (noise, fkd_state, rng),
+            (t_schedule, sampling_indices),
+            length=diffusion_steps,
+        )
+
+        actions = jnp.clip(final_x, -1, 1)
         qs = self.network.select("target_critic")(obs_repeated, actions)
         q = qs.min(axis=0)
         return actions[jnp.argmax(q)]
 
-    def sample_actions(self, observations, *, seed, **kwargs):
+    @jax.jit
+    def _sample_actions_fkd(self, observations, seed):
+        """Batched FKD-steered sampling: vmap over observations."""
+        num_particles = int(self.config["fkd_num_particles"])
         full_action_dim = self.config["action_dim"] * (
             self.config["horizon_length"] if self.config["action_chunking"] else 1
         )
+        batch_size = observations.shape[0]
 
+        keys = jax.random.split(seed, batch_size + 1)
+        noise_key, sample_keys = keys[0], keys[1:]
+        noise = jax.random.normal(
+            noise_key, (batch_size, num_particles, full_action_dim)
+        )
+
+        return jax.vmap(self._fkd_ddpm_sample_single)(
+            observations, noise, sample_keys
+        )
+
+    def sample_actions(self, observations, *, seed, **kwargs):
         single_obs = observations.ndim == 1
         if single_obs:
             observations = observations[None, :]
 
         num_particles = int(self.config.get("fkd_num_particles", 0))
         if num_particles <= 1:
-            return self._sample_actions_bc(observations, seed=seed, single_obs=single_obs)
+            actions = self._sample_actions_bc(observations, seed=seed)
+        else:
+            actions = self._sample_actions_fkd(observations, seed)
 
-        fkd_lambda = float(self.config["fkd_lambda"])
-        fkd_potential = str(self.config["fkd_potential"])
-        fkd_adaptive = bool(self.config["fkd_adaptive"])
-        fkd_resample_freq = int(self.config["fkd_resample_freq"])
-        fkd_t_start = int(self.config["fkd_t_start"])
-        fkd_t_end = int(self.config["fkd_t_end"])
-
-        batch_size = observations.shape[0]
-        all_actions = []
-        for b in range(batch_size):
-            obs_b = observations[b]
-            seed, noise_key, sampler_key = jax.random.split(seed, 3)
-            noise = jax.random.normal(
-                noise_key, (num_particles, full_action_dim)
-            )
-            action_b = self.fkd_ddpm_sampler(
-                sampler_key,
-                obs_b,
-                noise,
-                num_particles=num_particles,
-                fkd_lambda=fkd_lambda,
-                fkd_potential=fkd_potential,
-                fkd_adaptive=fkd_adaptive,
-                fkd_resample_freq=fkd_resample_freq,
-                fkd_t_start=fkd_t_start,
-                fkd_t_end=fkd_t_end,
-            )
-            all_actions.append(action_b)
-
-        actions = jnp.stack(all_actions, axis=0)
         if single_obs:
             actions = actions.squeeze(axis=0)
         return actions
 
     @jax.jit
-    def _sample_actions_bc(self, observations, *, seed, single_obs):
+    def _sample_actions_bc(self, observations, *, seed):
         """Standard DDPM sampling without FKD steering."""
         full_action_dim = self.config["action_dim"] * (
             self.config["horizon_length"] if self.config["action_chunking"] else 1
@@ -404,10 +392,7 @@ class IQLDDPMAgent(flax.struct.PyTreeNode):
         noise_key, sampler_key = jax.random.split(seed)
         noise = jax.random.normal(noise_key, (observations.shape[0], full_action_dim))
         actions = self.ddpm_sampler(sampler_key, observations, noise)
-        actions = jnp.clip(actions, -1, 1)
-        if single_obs:
-            actions = actions.squeeze(axis=0)
-        return actions
+        return jnp.clip(actions, -1, 1)
 
     # ------------------------------------------------------------------
     # Creation
@@ -512,6 +497,8 @@ class IQLDDPMAgent(flax.struct.PyTreeNode):
             alphas=alphas,
             alpha_hats=alpha_hats,
             betas=betas,
+            q_mean=jnp.float32(0.0),
+            q_std=jnp.float32(1.0),
         )
 
 
