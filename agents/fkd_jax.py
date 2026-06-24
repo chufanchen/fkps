@@ -75,9 +75,9 @@ def _compute_weights(
     return w, rs_out
 
 
-def _do_resample(rng, w, latents, rs_candidates, product_of_potentials, num_particles):
+def _do_resample(rng, w, latents, rs_candidates, product_of_potentials):
     indices = jax.random.categorical(
-        rng, jnp.log(jnp.maximum(w, 1e-30)), shape=(num_particles,)
+        rng, jnp.log(jnp.maximum(w, 1e-30)), shape=(latents.shape[0],)
     )
     return (
         latents[indices],
@@ -86,7 +86,7 @@ def _do_resample(rng, w, latents, rs_candidates, product_of_potentials, num_part
     )
 
 
-def _no_resample(rng, w, latents, rs_candidates, product_of_potentials, num_particles):
+def _no_resample(rng, w, latents, rs_candidates, product_of_potentials):
     return latents, rs_candidates, product_of_potentials
 
 
@@ -187,7 +187,7 @@ class FKDJax:
             should_resample & do_resample,
             _do_resample,
             _no_resample,
-            rng, w, latents, rs_out, product_of_potentials, self.num_particles,
+            rng, w, latents, rs_out, product_of_potentials,
         )
 
         new_rs = jnp.where(should_resample, new_rs, population_rs)
@@ -205,7 +205,8 @@ if __name__ == "__main__":
     import matplotlib.pyplot as plt
 
     num_particles = 8
-    x0s = jax.random.uniform(jax.random.PRNGKey(0), (num_particles, 1, 1))
+    pixels = [0.1, 0.3, 0.5, 0.7, 0.9, 0.05, 0.95, 0.4]
+    x0s = jnp.array(pixels, dtype=jnp.float32).reshape(num_particles, 1, 1)
 
     def reward_function(x):
         return -0.5 * x.sum(axis=(1, 2))
@@ -223,7 +224,7 @@ if __name__ == "__main__":
     state = fkd.init_state()
 
     rs = reward_function(x0s)
-    rng = jax.random.PRNGKey(42)
+    rng = jax.random.PRNGKey(0)
 
     resampled_latents, state = fkd.resample(
         state,
@@ -232,6 +233,13 @@ if __name__ == "__main__":
         rs_candidates=rs,
         rng=rng,
     )
+
+    print("Pixels:     ", pixels)
+    print("Rewards:    ", rs.tolist())
+    w = jnp.exp(10.0 * (rs - 0.0))
+    print("Weights:    ", w.tolist())
+    print("Normalized: ", (w / w.sum()).tolist())
+    print("Resampled:  ", resampled_latents.squeeze().tolist())
 
     fig, axs = plt.subplots(2, num_particles)
     axs[0, 0].set_title("Initial")

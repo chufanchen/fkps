@@ -181,21 +181,16 @@ class FKD:
 
 if __name__ == "__main__":
 
-    # Demonstration of FKD resampling step
     import matplotlib.pyplot as plt
-    import random
 
-    # set seed
-    random.seed(0)
-
-    # 1x1 pixel images
     num_particles = 8
-    x0s = torch.rand(num_particles, 1, 1)
+    pixels = [0.1, 0.3, 0.5, 0.7, 0.9, 0.05, 0.95, 0.4]
+    x0s = torch.tensor(pixels, dtype=torch.float32).reshape(num_particles, 1, 1)
 
-    # reward darker images
     reward_function = lambda x: -0.5 * x.sum(dim=(1, 2))
 
-    # Define the FKD steering mechanism
+    torch.manual_seed(0)
+
     fkds = FKD(
         potential_type=PotentialType.DIFF,
         lmbda=10.0,
@@ -209,19 +204,21 @@ if __name__ == "__main__":
         device=torch.device('cpu'),
     )
 
-    # Define the sampling index
-    sampling_idx = 0
-
-    # Perform resampling
     resampled_latents, resampled_images = fkds.resample(
-        sampling_idx=sampling_idx,
+        sampling_idx=0,
         latents=x0s,
         x0_preds=x0s,
     )
 
-    plt.rc('text', usetex=True)
-    fig, axs = plt.subplots(2, num_particles)
+    print("Pixels:     ", pixels)
+    print("Rewards:    ", reward_function(x0s).tolist())
+    rs = reward_function(x0s)
+    w = torch.exp(10.0 * (rs - 0.0))
+    print("Weights:    ", w.tolist())
+    print("Normalized: ", (w / w.sum()).tolist())
+    print("Resampled:  ", resampled_latents.squeeze().tolist())
 
+    fig, axs = plt.subplots(2, num_particles)
     axs[0, 0].set_title('Initial')
     axs[1, 0].set_title('Resampled')
 
@@ -230,7 +227,6 @@ if __name__ == "__main__":
         axs[1, i].imshow(
             resampled_images[i].detach().numpy(), cmap='gray', vmin=0, vmax=1
         )
-
         axs[1, i].axis('off')
         axs[0, i].axis('off')
 

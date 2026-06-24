@@ -5,6 +5,7 @@ from agents.dsrl import DSRLAgent
 from agents.edp import EDPAgent
 from agents.fawac import FAWACAgent
 from agents.fbrac import FBRACAgent
+from agents.fkps import FKPSAgent
 from agents.fql import FQLAgent
 from agents.grad_step import GradStepAgent
 from agents.ifql import IFQLAgent
@@ -33,5 +34,6 @@ agents = dict(
     dsrl=DSRLAgent,
     fawac=FAWACAgent,
     fbrac=FBRACAgent,
+    fkps=FKPSAgent,
     grad_step=GradStepAgent,
 )
