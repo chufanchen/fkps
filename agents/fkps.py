@@ -116,6 +116,22 @@ class FKPSAgent(flax.struct.PyTreeNode):
         return value_loss, {"value_loss": value_loss, "v": v.mean()}
 
     @jax.jit
+    def total_loss(self, batch, grad_params=None, rng=None):
+        if rng is None:
+            rng = self.rng
+        info = {}
+        bc_loss, policy_info = self.policy_loss(batch, rng=rng)
+        for k, v in policy_info.items():
+            info[f"policy/{k}"] = v
+        critic_loss, critic_info = self.critic_loss(batch)
+        for k, v in critic_info.items():
+            info[f"critic/{k}"] = v
+        value_loss, value_info = self.value_loss(batch)
+        for k, v in value_info.items():
+            info[f"value/{k}"] = v
+        return bc_loss + critic_loss + value_loss, info
+
+    @jax.jit
     def update(self, batch):
         new_rng, policy_rng = jax.random.split(self.rng, 2)
 
