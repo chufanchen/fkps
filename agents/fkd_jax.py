@@ -200,6 +200,71 @@ class FKDJax:
         return resampled_latents, new_state
 
 
+def fkd_sample(
+    fkd: "FKDJax",
+    *,
+    init_latents: jnp.ndarray,
+    step_fn,
+    reward_fn,
+    rng: jax.Array,
+    return_aux: bool = False,
+):
+    """Generic FKD-steered diffusion sampling driver.
+
+    Diffusion-framework agnostic: works with DDPM, flow matching, DDIM, etc.
+    The host policy provides two callbacks; FKD owns the particle resampling.
+
+    Args:
+        fkd: A configured FKDJax instance (defines num steps via time_steps).
+        init_latents: Initial particles, shape (num_particles, *latent_shape).
+            For diffusion this is the prior noise.
+        step_fn: Callable (latents, sampling_idx, rng) -> (next_latents, x0_hat).
+            One reverse step of the host diffusion policy. `sampling_idx` is a
+            traced int in [0, time_steps). `x0_hat` is the clean-sample estimate
+            used to score particles (shape (num_particles, *latent_shape)).
+        reward_fn: Callable (x0_hat) -> rs_candidates of shape (num_particles,).
+            Typically normalized Q(s, x0_hat).
+        rng: PRNG key.
+        return_aux: If True, also return per-step (ess, did_resample) diagnostics.
+
+    Returns:
+        final_latents (num_particles, *latent_shape), or
+        (final_latents, aux_dict) if return_aux.
+    """
+    num_steps = fkd.time_steps
+    sampling_indices = jnp.arange(num_steps)
+    init_state = fkd.init_state()
+
+    def scan_fn(carry, sampling_idx):
+        latents, fkd_st, rng_ = carry
+        rng_, step_rng, fkd_rng = jax.random.split(rng_, 3)
+
+        next_latents, x0_hat = step_fn(latents, sampling_idx, step_rng)
+        rs_candidates = reward_fn(x0_hat)
+
+        resampled, new_st = fkd.resample(
+            fkd_st,
+            sampling_idx=sampling_idx,
+            latents=next_latents,
+            rs_candidates=rs_candidates,
+            rng=fkd_rng,
+        )
+
+        if return_aux:
+            aux = {"rs_mean": rs_candidates.mean(), "rs_std": rs_candidates.std()}
+        else:
+            aux = None
+        return (resampled, new_st, rng_), aux
+
+    (final_latents, _, _), aux = jax.lax.scan(
+        scan_fn, (init_latents, init_state, rng), sampling_indices, length=num_steps
+    )
+
+    if return_aux:
+        return final_latents, aux
+    return final_latents
+
+
 if __name__ == "__main__":
 
     import matplotlib.pyplot as plt

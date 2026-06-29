@@ -19,7 +19,7 @@ import jax.numpy as jnp
 import ml_collections
 import optax
 from agents.common import aggregate_q, get_flat_batch
-from agents.fkd_jax import FKDJax, PotentialType
+from agents.fkd_jax import FKDJax, PotentialType, fkd_sample
 from utils.diffusion import (
     DDPM,
     FourierFeatures,
@@ -98,7 +98,7 @@ class FKPSAgent(flax.struct.PyTreeNode):
 
     def critic_loss(self, batch, critic_params=None):
         """IQL critic (Q) loss."""
-        H = self.config.get("horizon_length", 1)
+        H = self.config.get("horizon_length", 1)  # horizon for n-step returns or chunked critic
         batch_actions, next_obs, rewards, masks, valid_w = self._get_flat_batch(batch)
         next_v = self.value(next_obs)
         target_q = rewards + (self.config["discount"] ** H) * masks * next_v
@@ -116,11 +116,13 @@ class FKPSAgent(flax.struct.PyTreeNode):
         return value_loss, {"value_loss": value_loss, "v": v.mean()}
 
     @jax.jit
-    def total_loss(self, batch, grad_params=None, rng=None):
+    def total_loss(self, batch, grad_params, rng=None):
         if rng is None:
             rng = self.rng
+        
+        policy_params = grad_params if grad_params is not None else self.policy.params
+        bc_loss, policy_info = self.policy_loss(batch, policy_params=policy_params, rng=rng)
         info = {}
-        bc_loss, policy_info = self.policy_loss(batch, rng=rng)
         for k, v in policy_info.items():
             info[f"policy/{k}"] = v
         critic_loss, critic_info = self.critic_loss(batch)
@@ -235,6 +237,46 @@ class FKPSAgent(flax.struct.PyTreeNode):
             time_steps=diffusion_steps,
         )
 
+    def _ddpm_step(self, obs_repeated, current_x, sampling_idx, rng):
+        """One DDPM reverse step. Returns (next_latents, x0_hat).
+
+        sampling_idx in [0, diffusion_steps): 0 is noisiest. The DDPM time
+        index t = diffusion_steps - sampling_idx runs from diffusion_steps
+        down to 1.
+        """
+        diffusion_steps = self.config["diffusion_steps"]
+        t = diffusion_steps - sampling_idx
+
+        input_time = jnp.ones((*current_x.shape[:-1], 1)) * t
+        eps_pred = self.policy(obs_repeated, current_x, input_time)
+
+        x0_hat = (
+            1
+            / jnp.sqrt(self.alpha_hats[t])
+            * (current_x - jnp.sqrt(1 - self.alpha_hats[t]) * eps_pred)
+        )
+        if self.config["clip_sampler"]:
+            x0_hat = jnp.clip(x0_hat, -1, 1)
+            mean = (
+                1
+                / (1 - self.alpha_hats[t])
+                * (
+                    jnp.sqrt(self.alpha_hats[t - 1])
+                    * (1 - self.alphas[t])
+                    * x0_hat
+                    + jnp.sqrt(self.alphas[t])
+                    * (1 - self.alpha_hats[t - 1])
+                    * current_x
+                )
+            )
+        else:
+            mean = x0_hat
+
+        z = jax.random.normal(rng, mean.shape)
+        sigmas_t = jnp.sqrt(1 - self.alphas[t])
+        next_latents = mean + (t > 1) * (sigmas_t * z)
+        return next_latents, x0_hat
+
     def _fkd_ddpm_sample_single(self, obs, noise, rng):
         """FKD-steered DDPM reverse sampling for a single observation.
 
@@ -242,69 +284,25 @@ class FKPSAgent(flax.struct.PyTreeNode):
         Returns: best action (action_dim,).
         """
         num_particles = int(self.config["fkd_num_particles"])
-        diffusion_steps = self.config["diffusion_steps"]
         obs_repeated = jnp.broadcast_to(obs[None], (num_particles, *obs.shape))
 
         q_mean = self.q_mean
         q_std = jnp.maximum(self.q_std, 1e-6)
         fkd = self._build_fkd()
-        fkd_state = fkd.init_state()
-        t_schedule = jnp.arange(diffusion_steps, 0, -1)
-        sampling_indices = jnp.arange(diffusion_steps)
 
-        def scan_fn(carry, scan_inputs):
-            current_x, fkd_st, rng_ = carry
-            t, sampling_idx = scan_inputs
+        def step_fn(current_x, sampling_idx, step_rng):
+            return self._ddpm_step(obs_repeated, current_x, sampling_idx, step_rng)
 
-            input_time = jnp.ones((*current_x.shape[:-1], 1)) * t
-            eps_pred = self.policy(obs_repeated, current_x, input_time)
-
-            x0_hat = (
-                1
-                / jnp.sqrt(self.alpha_hats[t])
-                * (current_x - jnp.sqrt(1 - self.alpha_hats[t]) * eps_pred)
-            )
-            if self.config["clip_sampler"]:
-                x0_hat = jnp.clip(x0_hat, -1, 1)
-                current_x = (
-                    1
-                    / (1 - self.alpha_hats[t])
-                    * (
-                        jnp.sqrt(self.alpha_hats[t - 1])
-                        * (1 - self.alphas[t])
-                        * x0_hat
-                        + jnp.sqrt(self.alphas[t])
-                        * (1 - self.alpha_hats[t - 1])
-                        * current_x
-                    )
-                )
-            else:
-                current_x = x0_hat
-
-            rng_, noise_key, fkd_key = jax.random.split(rng_, 3)
-            z = jax.random.normal(noise_key, current_x.shape)
-            sigmas_t = jnp.sqrt(1 - self.alphas[t])
-            current_x = current_x + (t > 1) * (sigmas_t * z)
-
-            # Compute normalized Q as reward signal for FKD
+        def reward_fn(x0_hat):
             qs = self.target_critic(obs_repeated, x0_hat)
-            rs_candidates = (self._aggregate_q(qs) - q_mean) / q_std
+            return (self._aggregate_q(qs) - q_mean) / q_std
 
-            current_x, fkd_st = fkd.resample(
-                fkd_st,
-                sampling_idx=sampling_idx,
-                latents=current_x,
-                rs_candidates=rs_candidates,
-                rng=fkd_key,
-            )
-
-            return (current_x, fkd_st, rng_), None
-
-        (final_x, _, _), _ = jax.lax.scan(
-            scan_fn,
-            (noise, fkd_state, rng),
-            (t_schedule, sampling_indices),
-            length=diffusion_steps,
+        final_x = fkd_sample(
+            fkd,
+            init_latents=noise,
+            step_fn=step_fn,
+            reward_fn=reward_fn,
+            rng=rng,
         )
 
         actions = jnp.clip(final_x, -1, 1)
@@ -479,10 +477,10 @@ def get_config():
             agent_name="fkps",
             # Common hyperparameters.
             batch_size=256,
+            actor_hidden_dims=(512, 512, 512, 512),
             bc_lr=3e-4,
             critic_lr=3e-4,
             value_lr=3e-4,
-            actor_hidden_dims=(512, 512, 512, 512),
             actor_layer_norm=False,
             value_network_class="MLP",
             value_network_kwargs=dict(
@@ -494,7 +492,7 @@ def get_config():
             action_chunking=False,
             # RL hyperparameters.
             num_qs=2,
-            q_aggregation="min",
+            q_aggregation="min", # "min" or "mean".
             discount=0.99,
             expectile=0.9,
             tau=0.005,
