@@ -6,6 +6,7 @@ from agents.edp import EDPAgent
 from agents.fawac import FAWACAgent
 from agents.fbrac import FBRACAgent
 from agents.fkps import FKPSAgent
+from agents.flow_fkps import FlowFKPSAgent
 from agents.fql import FQLAgent
 from agents.grad_step import GradStepAgent
 from agents.ifql import IFQLAgent
@@ -35,5 +36,6 @@ agents = dict(
     fawac=FAWACAgent,
     fbrac=FBRACAgent,
     fkps=FKPSAgent,
+    flow_fkps=FlowFKPSAgent,
     grad_step=GradStepAgent,
 )
