@@ -402,6 +402,12 @@ def get_config():
             expectile=0.9,
             tau=0.005,
             # Flow / SDE hyperparameters.
+            # NOTE: the marginal-preserving SDE is only faithful if Euler-Maruyama
+            # is fine enough. Verified via scripts/test_flow_fkps_units.py:
+            #   denoise_steps=10  is faithful only for flow_noise_eps<=0.5;
+            #   flow_noise_eps>=1.0 needs denoise_steps>=50.
+            # Too-coarse + too-much-churn pushes actions off the data manifold and
+            # breaks BOTH the actor output and FKD's Q scoring.
             denoise_steps=100,
             # Churn: 0 = deterministic ODE, >0 = marginal-preserving SDE noise.
             flow_noise_eps=1.0,
