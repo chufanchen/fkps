@@ -168,23 +168,29 @@ class FlowFKPSAgent(flax.struct.PyTreeNode):
         """
         N = self.config["denoise_steps"]
         eps = self.config["flow_noise_eps"]
-        t = sampling_idx.astype(jnp.float32) / N
+        t0 = sampling_idx.astype(jnp.float32) / N
+        t1 = (sampling_idx.astype(jnp.float32) + 1.0) / N
         dt = 1.0 / N
 
-        ti = jnp.ones((current_x.shape[0],)) * t
+        ti = jnp.ones((current_x.shape[0],)) * t0
         v = self.policy(obs_rep, current_x, ti)
 
         # Marginal-preserving SDE drift/diffusion (see module docstring):
         #   drift = v + (g^2/2) score,  score = -(x - t v)/(1 - t),
         #   with g^2 = 2 eps (1 - t)  =>  drift = v (1 + eps t) - eps x.
-        drift = v * (1.0 + eps * t) - eps * current_x
-        g = jnp.sqrt(jnp.maximum(2.0 * eps * (1.0 - t), 0.0))
+        drift = v * (1.0 + eps * t0) - eps * current_x
+        # Exact diffusion variance over [t0, t1]: integral of g^2 = 2 eps (1 - t)
+        #   = eps ((1 - t0)^2 - (1 - t1)^2). The Euler-Maruyama g(t0)^2 dt rule
+        # overshoots near t -> 1 (g^2 vanishes linearly), injecting up to 2x too
+        # much noise on the final step; this closed form removes that bias.
+        noise_var = eps * ((1.0 - t0) ** 2 - (1.0 - t1) ** 2)
+        noise_scale = jnp.sqrt(jnp.maximum(noise_var, 0.0))
         z = jax.random.normal(rng, current_x.shape)
-        next_x = current_x + drift * dt + g * jnp.sqrt(dt) * z
+        next_x = current_x + drift * dt + noise_scale * z
 
         # Clean-action estimate: x1_hat = x + (1-t) v = E[a1 | a_t = x] exactly
         # (flow analogue of DDPM's Tweedie x0_hat). Clipped to the action box.
-        x1_hat = jnp.clip(current_x + (1.0 - t) * v, -1.0, 1.0)
+        x1_hat = jnp.clip(current_x + (1.0 - t0) * v, -1.0, 1.0)
         return next_x, x1_hat
 
     def _build_fkd(self):
@@ -396,7 +402,7 @@ def get_config():
             expectile=0.9,
             tau=0.005,
             # Flow / SDE hyperparameters.
-            denoise_steps=10,
+            denoise_steps=100,
             # Churn: 0 = deterministic ODE, >0 = marginal-preserving SDE noise.
             flow_noise_eps=1.0,
             # FKD inference hyperparameters.
@@ -405,7 +411,7 @@ def get_config():
             fkd_potential="diff",
             fkd_adaptive=True,
             fkd_resample_freq=1,
-            fkd_t_start=0,
+            fkd_t_start=20,
             fkd_t_end=-1,
             q_stats_ema=0.99,
         )

@@ -17,6 +17,16 @@ Outputs:
     fkd_toy_compare.png   — final samples, unsteered vs steered
 """
 
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
