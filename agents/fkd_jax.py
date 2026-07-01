@@ -43,6 +43,13 @@ class FKDState(NamedTuple):
     product_of_potentials: jnp.ndarray
 
 
+class FKDStepInfo(NamedTuple):
+    """Per-step diagnostics returned by resample()."""
+
+    ess: jnp.ndarray          # effective sample size (in [1, num_particles])
+    did_resample: jnp.ndarray  # 1.0 if particles were resampled this step
+
+
 def _compute_weights(
     potential_id: int,
     lmbda: float,
@@ -146,7 +153,7 @@ class FKDJax:
         latents: jnp.ndarray,
         rs_candidates: jnp.ndarray,
         rng: jax.Array,
-    ) -> Tuple[jnp.ndarray, FKDState]:
+    ) -> Tuple[jnp.ndarray, FKDState, "FKDStepInfo"]:
         """JIT-compatible resample. sampling_idx can be a traced integer.
 
         Args:
@@ -157,7 +164,8 @@ class FKDJax:
             rng: PRNG key for categorical sampling.
 
         Returns:
-            (resampled_latents, new_state)
+            (resampled_latents, new_state, step_info) where step_info holds the
+            effective sample size and whether resampling actually fired.
         """
         should_resample = self.should_resample_mask[sampling_idx]
         is_final = sampling_idx == (self.time_steps - 1)
@@ -176,15 +184,18 @@ class FKDJax:
         w = jnp.clip(w, 0, 1e10)
         w = jnp.where(jnp.isnan(w), 0.0, w)
 
+        # Effective sample size — always computed for diagnostics.
+        normalized_w = w / jnp.maximum(w.sum(), 1e-30)
+        ess = 1.0 / jnp.maximum((normalized_w ** 2).sum(), 1e-30)
+
         if self.adaptive_resampling:
-            normalized_w = w / jnp.maximum(w.sum(), 1e-30)
-            ess = 1.0 / (normalized_w ** 2).sum()
             do_resample = (ess < 0.5 * self.num_particles) | is_final
         else:
             do_resample = jnp.bool_(True)
 
+        active = should_resample & do_resample
         resampled_latents, new_rs, new_product = jax.lax.cond(
-            should_resample & do_resample,
+            active,
             _do_resample,
             _no_resample,
             rng, w, latents, rs_out, product_of_potentials,
@@ -197,7 +208,8 @@ class FKDJax:
             population_rs=new_rs,
             product_of_potentials=new_product,
         )
-        return resampled_latents, new_state
+        info = FKDStepInfo(ess=ess, did_resample=active.astype(jnp.float32))
+        return resampled_latents, new_state, info
 
 
 def fkd_sample(
@@ -242,7 +254,7 @@ def fkd_sample(
         next_latents, x0_hat = step_fn(latents, sampling_idx, step_rng)
         rs_candidates = reward_fn(x0_hat)
 
-        resampled, new_st = fkd.resample(
+        resampled, new_st, step_info = fkd.resample(
             fkd_st,
             sampling_idx=sampling_idx,
             latents=next_latents,
@@ -251,7 +263,12 @@ def fkd_sample(
         )
 
         if return_aux:
-            aux = {"rs_mean": rs_candidates.mean(), "rs_std": rs_candidates.std()}
+            aux = {
+                "ess": step_info.ess,
+                "did_resample": step_info.did_resample,
+                "rs_mean": rs_candidates.mean(),
+                "rs_std": rs_candidates.std(),
+            }
         else:
             aux = None
         return (resampled, new_st, rng_), aux
@@ -291,7 +308,7 @@ if __name__ == "__main__":
     rs = reward_function(x0s)
     rng = jax.random.PRNGKey(0)
 
-    resampled_latents, state = fkd.resample(
+    resampled_latents, state, _ = fkd.resample(
         state,
         sampling_idx=jnp.int32(0),
         latents=x0s,

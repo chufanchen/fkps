@@ -38,7 +38,14 @@ class FlowFKPSAgent(flax.struct.PyTreeNode):
     Inference:
       - Marginal-preserving SDE sampling (churn eps) with FKD resampling.
       - Q(s, a) from the target critic is the FKD reward signal.
+
+    Test-time guidance: supports the same eval sweep as QGF. The eval harness
+    calls sample_actions(guidance_weight=w) for each w in FLAGS.guidance_weights
+    and reports the best; here `guidance_weight` overrides the FKD lambda (the
+    steering strength), so the sweep is over FKD steering intensity.
     """
+
+    support_guidance = True
 
     rng: Any
     policy: TrainState
@@ -193,14 +200,16 @@ class FlowFKPSAgent(flax.struct.PyTreeNode):
         x1_hat = jnp.clip(current_x + (1.0 - t0) * v, -1.0, 1.0)
         return next_x, x1_hat
 
-    def _build_fkd(self):
+    def _build_fkd(self, lmbda=None):
         denoise_steps = self.config["denoise_steps"]
         fkd_t_end = int(self.config["fkd_t_end"])
         if fkd_t_end < 0:
             fkd_t_end = denoise_steps - 1
+        if lmbda is None:
+            lmbda = float(self.config["fkd_lambda"])
         return FKDJax(
             potential_type=PotentialType(str(self.config["fkd_potential"])),
-            lmbda=float(self.config["fkd_lambda"]),
+            lmbda=lmbda,
             num_particles=int(self.config["fkd_num_particles"]),
             adaptive_resampling=bool(self.config["fkd_adaptive"]),
             resample_frequency=int(self.config["fkd_resample_freq"]),
@@ -209,10 +218,11 @@ class FlowFKPSAgent(flax.struct.PyTreeNode):
             time_steps=denoise_steps,
         )
 
-    def _fkd_flow_sample_single(self, obs, noise, rng):
+    def _fkd_flow_sample_single(self, obs, noise, rng, lmbda):
         """FKD-steered flow SDE sampling for a single observation.
 
         obs: (obs_dim,), noise: (num_particles, action_dim), rng: PRNGKey.
+        lmbda: FKD steering strength (traced scalar).
         Returns: best action (action_dim,).
         """
         num_particles = int(self.config["fkd_num_particles"])
@@ -220,7 +230,7 @@ class FlowFKPSAgent(flax.struct.PyTreeNode):
 
         q_mean = self.q_mean
         q_std = jnp.maximum(self.q_std, 1e-6)
-        fkd = self._build_fkd()
+        fkd = self._build_fkd(lmbda=lmbda)
 
         def step_fn(current_x, sampling_idx, step_rng):
             return self._flow_sde_step(obs_rep, current_x, sampling_idx, step_rng)
@@ -243,8 +253,12 @@ class FlowFKPSAgent(flax.struct.PyTreeNode):
         return actions[jnp.argmax(q)]
 
     @jax.jit
-    def _sample_actions_fkd(self, observations, seed):
-        """Batched FKD-steered sampling: vmap over observations."""
+    def _sample_actions_fkd(self, observations, seed, lmbda):
+        """Batched FKD-steered sampling: vmap over observations.
+
+        lmbda is shared across the batch (in_axes=None), so the eval harness can
+        sweep FKD steering strength without rebuilding/retracing per observation.
+        """
         num_particles = int(self.config["fkd_num_particles"])
         full_action_dim = self.config["action_dim"] * (
             self.config["horizon_length"]
@@ -258,9 +272,67 @@ class FlowFKPSAgent(flax.struct.PyTreeNode):
         noise = jax.random.normal(
             noise_key, (batch_size, num_particles, full_action_dim)
         )
-        return jax.vmap(self._fkd_flow_sample_single)(
-            observations, noise, sample_keys
+        return jax.vmap(self._fkd_flow_sample_single, in_axes=(0, 0, 0, None))(
+            observations, noise, sample_keys, lmbda
         )
+
+    def _fkd_aux_single(self, obs, noise, rng, lmbda):
+        """Run the FKD sampler for one obs, return per-step (ess, did_resample)."""
+        num_particles = int(self.config["fkd_num_particles"])
+        obs_rep = jnp.broadcast_to(obs[None], (num_particles, *obs.shape))
+        q_mean = self.q_mean
+        q_std = jnp.maximum(self.q_std, 1e-6)
+        fkd = self._build_fkd(lmbda=lmbda)
+
+        def step_fn(current_x, sampling_idx, step_rng):
+            return self._flow_sde_step(obs_rep, current_x, sampling_idx, step_rng)
+
+        def reward_fn(x1_hat):
+            qs = self.target_critic(obs_rep, x1_hat)
+            return (self._aggregate_q(qs) - q_mean) / q_std
+
+        _, aux = fkd_sample(
+            fkd,
+            init_latents=noise,
+            step_fn=step_fn,
+            reward_fn=reward_fn,
+            rng=rng,
+            return_aux=True,
+        )
+        return aux["ess"], aux["did_resample"], aux["rs_std"]
+
+    @jax.jit
+    def fkd_ess_curve(self, observations, seed):
+        """Batch-averaged FKD diagnostics per sampling step.
+
+        Returns a dict of arrays of shape (denoise_steps,):
+            ess          - effective sample size, averaged over the batch
+            did_resample - fraction of batch that resampled at each step
+            rs_std       - std of the particle rewards (steering signal strength)
+        Use during training/eval to watch how FKD behaves as Q improves.
+        """
+        num_particles = int(self.config["fkd_num_particles"])
+        full_action_dim = self.config["action_dim"] * (
+            self.config["horizon_length"]
+            if self.config.get("action_chunking", False)
+            else 1
+        )
+        batch_size = observations.shape[0]
+        lmbda = jnp.float32(self.config["fkd_lambda"])
+
+        keys = jax.random.split(seed, batch_size + 1)
+        noise_key, sample_keys = keys[0], keys[1:]
+        noise = jax.random.normal(
+            noise_key, (batch_size, num_particles, full_action_dim)
+        )
+        ess, did, rs_std = jax.vmap(self._fkd_aux_single, in_axes=(0, 0, 0, None))(
+            observations, noise, sample_keys, lmbda
+        )
+        return {
+            "ess": ess.mean(axis=0),
+            "did_resample": did.mean(axis=0),
+            "rs_std": rs_std.mean(axis=0),
+        }
 
     @jax.jit
     def _sample_actions_bc(self, observations, *, seed):
@@ -282,7 +354,10 @@ class FlowFKPSAgent(flax.struct.PyTreeNode):
         a, _ = jax.lax.scan(step, a, jnp.arange(N), length=N)
         return jnp.clip(a, -1, 1)
 
-    def sample_actions(self, observations, *, seed, **kwargs):
+    def sample_actions(
+        self, observations, *, seed, guidance_weight=None,
+        rejection_sampling=1, **kwargs
+    ):
         single_obs = observations.ndim == 1
         if single_obs:
             observations = observations[None, :]
@@ -291,7 +366,15 @@ class FlowFKPSAgent(flax.struct.PyTreeNode):
         if num_particles <= 1:
             actions = self._sample_actions_bc(observations, seed=seed)
         else:
-            actions = self._sample_actions_fkd(observations, seed)
+            # guidance_weight (from the eval sweep) overrides the FKD lambda.
+            lmbda = (
+                float(self.config["fkd_lambda"])
+                if guidance_weight is None
+                else float(guidance_weight)
+            )
+            actions = self._sample_actions_fkd(
+                observations, seed, jnp.float32(lmbda)
+            )
 
         if single_obs:
             actions = actions.squeeze(axis=0)

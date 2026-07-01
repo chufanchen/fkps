@@ -127,7 +127,7 @@ def sample_with_trajectory(fkd, init_latents, step_fn, reward_fn, rng):
         rng, step_rng, fkd_rng = jax.random.split(rng, 3)
         next_latents, x0_hat = step_fn(latents, jnp.int32(sampling_idx), step_rng)
         rs = reward_fn(x0_hat)
-        latents, state = fkd.resample(
+        latents, state, _ = fkd.resample(
             state,
             sampling_idx=jnp.int32(sampling_idx),
             latents=next_latents,

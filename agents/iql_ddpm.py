@@ -327,7 +327,7 @@ class IQLDDPMAgent(flax.struct.PyTreeNode):
             qs = self.network.select("target_critic")(obs_repeated, x0_hat)
             rs_candidates = (qs.min(axis=0) - q_mean) / q_std
 
-            current_x, fkd_st = fkd.resample(
+            current_x, fkd_st, _ = fkd.resample(
                 fkd_st,
                 sampling_idx=sampling_idx,
                 latents=current_x,

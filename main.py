@@ -526,6 +526,30 @@ def main(_):
                 train_metrics.update(
                     {f"validation/{k}": v for k, v in val_info.items()}
                 )
+
+            # FKD effective-sample-size curve (for FKD/particle-steering agents).
+            if (
+                hasattr(agent, "fkd_ess_curve")
+                and int(agent.config.get("fkd_num_particles", 0)) > 1
+                and val_dataset is not None
+            ):
+                # A small obs subset keeps this diagnostic cheap.
+                obs = np.asarray(val_batch["observations"])[:16]
+                aux = agent.fkd_ess_curve(obs, jax.random.PRNGKey(i))
+                ess = np.asarray(aux["ess"])
+                did = np.asarray(aux["did_resample"])
+                rs_std = np.asarray(aux["rs_std"])
+                train_metrics["fkd/ess_mean"] = float(ess.mean())
+                train_metrics["fkd/ess_min"] = float(ess.min())
+                train_metrics["fkd/resample_frac"] = float(did.mean())
+                train_metrics["fkd/rs_std_mean"] = float(rs_std.mean())
+                curve = wandb.Table(
+                    data=[[k, float(e)] for k, e in enumerate(ess)],
+                    columns=["step", "ess"],
+                )
+                train_metrics["fkd/ess_curve"] = wandb.plot.line(
+                    curve, "step", "ess", title="FKD ESS vs sampling step"
+                )
             train_metrics["time/epoch_time"] = (
                 time.time() - last_time
             ) / FLAGS.log_interval
