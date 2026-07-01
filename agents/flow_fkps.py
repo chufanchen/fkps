@@ -299,16 +299,22 @@ class FlowFKPSAgent(flax.struct.PyTreeNode):
             rng=rng,
             return_aux=True,
         )
-        return aux["ess"], aux["did_resample"], aux["rs_std"]
+        return aux
 
     @jax.jit
     def fkd_ess_curve(self, observations, seed):
         """Batch-averaged FKD diagnostics per sampling step.
 
-        Returns a dict of arrays of shape (denoise_steps,):
-            ess          - effective sample size, averaged over the batch
+        Returns a dict of arrays of shape (denoise_steps,), each averaged over
+        the batch:
+            ess          - effective sample size
             did_resample - fraction of batch that resampled at each step
-            rs_std       - std of the particle rewards (steering signal strength)
+            logw_std     - std of log-weights (= lambda*std(diff)); ~0 => uniform
+                           weights => FKD is not steering
+            diff_std     - std of the per-particle potential exponent Q_t - Q_{t-1}
+                           (lambda-independent): "are the diffs basically the same?"
+            w_max        - largest normalized weight (1/N uniform .. 1 collapse)
+            rs_std       - std of particle rewards Q_t
         Use during training/eval to watch how FKD behaves as Q improves.
         """
         num_particles = int(self.config["fkd_num_particles"])
@@ -325,14 +331,10 @@ class FlowFKPSAgent(flax.struct.PyTreeNode):
         noise = jax.random.normal(
             noise_key, (batch_size, num_particles, full_action_dim)
         )
-        ess, did, rs_std = jax.vmap(self._fkd_aux_single, in_axes=(0, 0, 0, None))(
+        aux = jax.vmap(self._fkd_aux_single, in_axes=(0, 0, 0, None))(
             observations, noise, sample_keys, lmbda
         )
-        return {
-            "ess": ess.mean(axis=0),
-            "did_resample": did.mean(axis=0),
-            "rs_std": rs_std.mean(axis=0),
-        }
+        return {k: v.mean(axis=0) for k, v in aux.items()}
 
     @jax.jit
     def _sample_actions_bc(self, observations, *, seed):

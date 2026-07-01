@@ -48,6 +48,12 @@ class FKDStepInfo(NamedTuple):
 
     ess: jnp.ndarray          # effective sample size (in [1, num_particles])
     did_resample: jnp.ndarray  # 1.0 if particles were resampled this step
+    logw_std: jnp.ndarray     # std of log-weights across particles (= lambda*std(diff)
+    #                           for DIFF). ~0 => uniform weights => no steering.
+    diff_std: jnp.ndarray     # std of the raw potential exponent across particles
+    #                           (log-weight / lambda); the "are the diffs the same?"
+    #                           signal, independent of lambda.
+    w_max: jnp.ndarray        # largest normalized weight (1/N => uniform, 1 => collapse)
 
 
 def _compute_weights(
@@ -188,6 +194,13 @@ class FKDJax:
         normalized_w = w / jnp.maximum(w.sum(), 1e-30)
         ess = 1.0 / jnp.maximum((normalized_w ** 2).sum(), 1e-30)
 
+        # Weight-spread diagnostics: is FKD actually distinguishing particles?
+        logw = jnp.log(jnp.maximum(w, 1e-30))
+        logw_std = logw.std()
+        lam = jnp.maximum(jnp.abs(self.lmbda), 1e-8)
+        diff_std = logw_std / lam
+        w_max = normalized_w.max()
+
         if self.adaptive_resampling:
             do_resample = (ess < 0.5 * self.num_particles) | is_final
         else:
@@ -208,7 +221,13 @@ class FKDJax:
             population_rs=new_rs,
             product_of_potentials=new_product,
         )
-        info = FKDStepInfo(ess=ess, did_resample=active.astype(jnp.float32))
+        info = FKDStepInfo(
+            ess=ess,
+            did_resample=active.astype(jnp.float32),
+            logw_std=logw_std,
+            diff_std=diff_std,
+            w_max=w_max,
+        )
         return resampled_latents, new_state, info
 
 
@@ -266,6 +285,9 @@ def fkd_sample(
             aux = {
                 "ess": step_info.ess,
                 "did_resample": step_info.did_resample,
+                "logw_std": step_info.logw_std,
+                "diff_std": step_info.diff_std,
+                "w_max": step_info.w_max,
                 "rs_mean": rs_candidates.mean(),
                 "rs_std": rs_candidates.std(),
             }

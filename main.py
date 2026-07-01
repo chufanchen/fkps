@@ -538,17 +538,28 @@ def main(_):
                 aux = agent.fkd_ess_curve(obs, jax.random.PRNGKey(i))
                 ess = np.asarray(aux["ess"])
                 did = np.asarray(aux["did_resample"])
-                rs_std = np.asarray(aux["rs_std"])
+                logw_std = np.asarray(aux["logw_std"])
+                diff_std = np.asarray(aux["diff_std"])
+                w_max = np.asarray(aux["w_max"])
                 train_metrics["fkd/ess_mean"] = float(ess.mean())
                 train_metrics["fkd/ess_min"] = float(ess.min())
                 train_metrics["fkd/resample_frac"] = float(did.mean())
-                train_metrics["fkd/rs_std_mean"] = float(rs_std.mean())
+                train_metrics["fkd/logw_std_mean"] = float(logw_std.mean())
+                train_metrics["fkd/diff_std_mean"] = float(diff_std.mean())
+                train_metrics["fkd/w_max_mean"] = float(w_max.mean())
                 curve = wandb.Table(
-                    data=[[k, float(e)] for k, e in enumerate(ess)],
-                    columns=["step", "ess"],
+                    data=[
+                        [k, float(e), float(l), float(d)]
+                        for k, (e, l, d) in enumerate(zip(ess, logw_std, diff_std))
+                    ],
+                    columns=["step", "ess", "logw_std", "diff_std"],
                 )
                 train_metrics["fkd/ess_curve"] = wandb.plot.line(
                     curve, "step", "ess", title="FKD ESS vs sampling step"
+                )
+                train_metrics["fkd/logw_std_curve"] = wandb.plot.line(
+                    curve, "step", "logw_std",
+                    title="FKD log-weight spread vs step (0 => uniform)",
                 )
             train_metrics["time/epoch_time"] = (
                 time.time() - last_time

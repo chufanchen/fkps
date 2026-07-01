@@ -97,7 +97,7 @@ def run_ess(lmbda, N, eps, num_particles, adaptive, rng):
         rng=rng,
         return_aux=True,
     )
-    return np.array(aux["ess"]), np.array(aux["did_resample"])
+    return {k: np.array(v) for k, v in aux.items()}
 
 
 def main():
@@ -107,50 +107,58 @@ def main():
     lambdas = [0.0, 0.5, 1.0, 2.0, 4.0, 8.0]
     rng = jax.random.PRNGKey(0)
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 5))
     steps = np.arange(N)
 
+    # Cache adaptive runs so all three panels share them.
+    runs = {}
     for lam in lambdas:
         rng, k = jax.random.split(rng)
-        ess, did = run_ess(lam, N, eps, num_particles, adaptive=True, rng=k)
-        ax1.plot(steps, ess, label=f"λ={lam}")
-        # mark resample steps for the mid lambda only, to keep it readable
-        if lam == 2.0:
-            rs_steps = steps[did > 0.5]
-            ax1.scatter(rs_steps, ess[did > 0.5], s=10, color="k", zorder=5,
-                        label="resample (λ=2)")
+        runs[lam] = run_ess(lam, N, eps, num_particles, adaptive=True, rng=k)
 
+    # Panel 1: ESS
+    for lam in lambdas:
+        aux = runs[lam]
+        ax1.plot(steps, aux["ess"], label=f"λ={lam}")
     ax1.axhline(num_particles, ls="--", c="gray", lw=1)
     ax1.axhline(0.5 * num_particles, ls=":", c="red", lw=1,
                 label="resample threshold (N/2)")
     ax1.set_xlabel("sampling step (0=noise → N=data)")
     ax1.set_ylabel("ESS")
-    ax1.set_title(f"ESS vs step (adaptive, N={N}, eps={eps}, P={num_particles})")
+    ax1.set_title(f"ESS vs step (N={N}, eps={eps}, P={num_particles})")
     ax1.set_ylim(0, num_particles * 1.05)
     ax1.legend(fontsize=8)
 
-    # Non-adaptive (resample every step) for contrast
+    # Panel 2: diff_std = std over particles of (Q_t - Q_{t-1}).
+    # This is the KEY "are the weights basically the same?" diagnostic:
+    # diff_std ~ 0 => all particles have the same potential => uniform weights.
+    # It is lambda-independent in units (does not multiply by lambda).
     for lam in lambdas:
-        rng, k = jax.random.split(rng)
-        ess, _ = run_ess(lam, N, eps, num_particles, adaptive=False, rng=k)
-        ax2.plot(steps, ess, label=f"λ={lam}")
-    ax2.axhline(num_particles, ls="--", c="gray", lw=1)
+        ax2.plot(steps, runs[lam]["diff_std"], label=f"λ={lam}")
     ax2.set_xlabel("sampling step")
-    ax2.set_ylabel("ESS (pre-resample weights)")
-    ax2.set_title("ESS vs step (non-adaptive: resample every step)")
-    ax2.set_ylim(0, num_particles * 1.05)
+    ax2.set_ylabel("std over particles of (Q_t - Q_{t-1})")
+    ax2.set_title("Potential-diff spread (≈0 => weights uniform => no steering)")
     ax2.legend(fontsize=8)
+
+    # Panel 3: log-weight spread = lambda * diff_std (the actual weight non-uniformity).
+    for lam in lambdas:
+        ax3.plot(steps, runs[lam]["logw_std"], label=f"λ={lam}")
+    ax3.set_xlabel("sampling step")
+    ax3.set_ylabel("std of log-weights (= λ·diff_std)")
+    ax3.set_title("Log-weight spread (0 => uniform weights)")
+    ax3.legend(fontsize=8)
 
     fig.tight_layout()
     fig.savefig("fkd_ess_curve.png", dpi=120)
     print("Saved fkd_ess_curve.png")
 
     # Console summary
-    print("\nlambda |  mean ESS  | min ESS | resample steps")
+    print("\nlambda | mean ESS | min ESS | mean diff_std | mean logw_std | resample")
     for lam in lambdas:
-        rng, k = jax.random.split(rng)
-        ess, did = run_ess(lam, N, eps, num_particles, adaptive=True, rng=k)
-        print(f"{lam:>6} | {ess.mean():>9.1f} | {ess.min():>7.1f} | "
+        aux = runs[lam]
+        ess, did = aux["ess"], aux["did_resample"]
+        print(f"{lam:>6} | {ess.mean():>8.1f} | {ess.min():>7.1f} | "
+              f"{aux['diff_std'].mean():>13.4f} | {aux['logw_std'].mean():>13.4f} | "
               f"{int(did.sum())}/{N}")
 
 
